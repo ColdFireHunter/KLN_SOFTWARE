@@ -23,6 +23,8 @@ public:
     int getBatteryPercent();
     void updateBatteryStatus();
 
+    void setChargerEnable(bool enable);
+
 private:
     void convertADCValues();
     Neotimer *adc_timer;   // Timer for ADC readings

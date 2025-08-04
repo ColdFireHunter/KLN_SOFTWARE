@@ -1,6 +1,6 @@
 #include <global.h>
 
-HardwareSerial DEBUG_SERIAL(DEBUG_RX, DEBUG_TX);
+HardwareSerial DEBUG_SERIAL(DEBUG_TX_RX, DEBUG_TX_RX);
 
 volatile uint16_t adc_buffer[3] = {0, 0, 0}; // Buffer for ADC readings
 int battery_voltage = 0;                     // Variable to store battery voltage

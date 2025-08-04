@@ -47,9 +47,9 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 gpio GPIO;
 
-Neotimer battery_fault_timer(50);         // 100 ms fault check
-uint32_t last_battery_voltage_mV = 0;     // last reading, mV
-uint32_t battery_jump_threshold_mV = 100; // configurable jump threshold, mV
+Neotimer battery_fault_timer(50);            // 500 ms fault check
+uint32_t last_battery_stddev = 0;            // last reading, mV
+uint32_t battery_jump_threshold_stddev = 50; // configurable jump threshold, mV
 
 static void MX_ADC1_Init(void)
 {
@@ -132,6 +132,74 @@ static void MX_DMA_Init(void)
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 }
 
+//------------------------------------------------------------------------------
+// Common latch function: if `cond` true and no fault yet, latch with `cause`:
+//   cause=1 → 5 s min‐off + stddev/voltage recovery
+//   cause=2 → 10 s min‐off only
+//------------------------------------------------------------------------------
+static bool batteryFaultLatched = false;
+static uint8_t batteryFaultCause = 0;
+static uint32_t faultDisableTimeMs = 0;
+static uint32_t faultMinOffMs = 0;
+
+void clearFault()
+{
+  batteryFaultLatched = false;
+  batteryFaultCause = 0;
+  DEBUG_SERIAL.println("Battery‐fault cleared, re‐enabling charger.");
+  GPIO.setChargerEnable(true);
+}
+void tryLatchFault(bool cond, uint8_t cause, uint32_t minOffMs)
+{
+  if (!batteryFaultLatched && cond)
+  {
+    batteryFaultLatched = true;
+    batteryFaultCause = cause;
+    faultDisableTimeMs = millis();
+    faultMinOffMs = minOffMs;
+
+    const char *why = (cause == 1
+                           ? "stddev spike/open‐fuse"
+                           : "random low‐voltage check");
+    DEBUG_SERIAL.printf(
+        "Battery fault latched (%s)! Disabling charger for %lums.\n\r",
+        why, minOffMs);
+    GPIO.setChargerEnable(false);
+  }
+}
+//------------------------------------------------------------------------------
+// Recovery: once the min‐off time has elapsed, clear the latch if:
+//  • cause==1: stddev spike cleared AND voltage >10 000 mV
+//  • cause==2: (no other condition)
+//------------------------------------------------------------------------------
+void handleRecovery()
+{
+  if (!batteryFaultLatched)
+    return;
+
+  uint32_t now = millis();
+  if (now - faultDisableTimeMs < faultMinOffMs)
+    return;
+
+  if (batteryFaultCause == 1)
+  {
+    // re‐read conditions
+    uint32_t curr_std = static_cast<uint32_t>(battery_stddev);
+    uint32_t curr_mv = battery_voltage;
+    bool open_or_fuse_fault =
+        (abs((int32_t)curr_std - (int32_t)last_battery_stddev) > static_cast<int32_t>(battery_jump_threshold_stddev));
+
+    if (!open_or_fuse_fault && curr_mv > 10000)
+    {
+      clearFault();
+    }
+  }
+  else // cause==2
+  {
+    clearFault();
+  }
+}
+
 void setup()
 {
 
@@ -160,23 +228,58 @@ void loop()
   GPIO.setLED(LED_CHGR, GPIO.getChargerStatus(), GPIO.getChargerStatus());
   GPIO.setLED(LED_LINE, GPIO.getMuxStatus(), false);
   GPIO.setLED(LED_BAT, !GPIO.getMuxStatus(), false);
-  if (battery_fault_timer.repeat())
+
+  // --- enable jump/fuse & random logic 1 s after boot ---
+  static bool faultLogicEnabled = false;
+  static uint32_t nextRandomCheckMs = 0;
+  if (!faultLogicEnabled && millis() >= 1000)
   {
-    uint32_t current_mv = static_cast<uint32_t>(battery_stddev);
-    bool open_or_fuse_fault =
-        last_battery_voltage_mV > 0 &&
-        (abs((int32_t)current_mv - (int32_t)last_battery_voltage_mV) > static_cast<int32_t>(battery_jump_threshold_mV));
+    faultLogicEnabled = true;
+    last_battery_stddev = static_cast<uint32_t>(battery_stddev);
+    // schedule first random check in [10,30] min
+    nextRandomCheckMs = millis() + 60000;
+    DEBUG_SERIAL.println("Battery‐fault logic enabled.");
+  }
 
-    last_battery_voltage_mV = current_mv;
+  if (faultLogicEnabled)
+  {
+    uint32_t now = millis();
 
-    if (open_or_fuse_fault)
+    // —— periodic ADC/DMA stddev‐based check ——
+    if (battery_fault_timer.repeat())
     {
-      DEBUG_SERIAL.println("Battery fault detected: open or fuse fault");
+      uint32_t curr_std = static_cast<uint32_t>(battery_stddev);
+      bool open_or_fuse_fault =
+          (last_battery_stddev > 0) &&
+          (abs((int32_t)curr_std - (int32_t)last_battery_stddev) > static_cast<int32_t>(battery_jump_threshold_stddev));
+      last_battery_stddev = curr_std;
+
+      tryLatchFault(open_or_fuse_fault, 1 /*cause*/, 5000);
     }
 
-    bool low_percent = GPIO.getBatteryPercent() < 15.0f;
-    GPIO.setBatteryFault(low_percent || open_or_fuse_fault);
+    // —— random “health” check every 10–30 min ——
+    if ((int32_t)(now - nextRandomCheckMs) >= 0)
+    {
+      // schedule next
+      nextRandomCheckMs = now + 600000;
+      DEBUG_SERIAL.println("Random battery health check...");
+      // only if charger is off
+      if (!GPIO.getChargerStatus())
+      {
+        uint32_t curr_mv = battery_voltage;
+        bool lowVoltageFault = (curr_mv < 10000);
+        tryLatchFault(lowVoltageFault, 2 /*cause*/, 10000);
+      }
+    }
+
+    // —— recovery logic ——
+    handleRecovery();
+
+    // always alarm immediately on low SOC
+    bool low_percent = (GPIO.getBatteryPercent() < 15.0f);
+    GPIO.setBatteryFault(batteryFaultLatched || low_percent);
   }
+
   GPIO.setLineFault(!GPIO.getMuxStatus());
 }
 

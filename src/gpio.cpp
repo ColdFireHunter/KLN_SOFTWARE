@@ -36,7 +36,6 @@ void gpio::initialize()
         pinMode(LED_PINS[i], OUTPUT);
         digitalWrite(LED_PINS[i], LOW);
     }
-
     // Fault outputs
     pinMode(ERROR_BAT, OUTPUT);
     digitalWrite(ERROR_BAT, LOW);
@@ -46,6 +45,9 @@ void gpio::initialize()
     // Status inputs
     pinMode(STATUS_CHGR, INPUT);
     pinMode(STATUS_MUX, INPUT);
+
+    pinMode(CHGR_EN, OUTPUT);
+    digitalWrite(CHGR_EN, LOW); // Disable charger by default
 }
 
 void gpio::handler()
@@ -223,5 +225,17 @@ void gpio::updateBatteryStatus()
         setLED(LED_MED, false, false);
         setLED(LED_HIGH, false, false);
         setLED(LED_FULL, false, false);
+    }
+}
+void gpio::setChargerEnable(bool enable)
+{
+    if (enable)
+    {
+        pinMode(CHGR_EN, INPUT); // Set to input to disable pull-up
+    }
+    else
+    {
+        pinMode(CHGR_EN, OUTPUT);   // Set to output to control the charger
+        digitalWrite(CHGR_EN, LOW); // Disable charger
     }
 }

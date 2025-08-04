@@ -5,7 +5,7 @@
 
 // ADC
 #define ADC_BATTERY PA0
-#define DISBLE_CHGR PA1
+#define ADC_LINE PA1
 
 // LEDS
 #define LED_LOW PA4
@@ -22,12 +22,12 @@
 
 // CHARGER
 #define STATUS_CHGR PA5
+#define CHGR_EN PA12
 
 // MUX
 #define STATUS_MUX PC15
 
 // USART
-#define DEBUG_TX PA9_R
-#define DEBUG_RX PA10_R
+#define DEBUG_TX_RX PA9_R
 
 #endif
