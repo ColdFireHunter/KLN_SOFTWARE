@@ -43,6 +43,9 @@ void SystemClock_Config(void)
   }
 }
 
+// STM32G0: Unique ID base address (96-bit UID)
+#define UID_BASE (0x1FFF7590UL) // Unique device ID register base
+
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 gpio GPIO;
@@ -132,6 +135,48 @@ static void MX_DMA_Init(void)
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 }
 
+static uint32_t _rng_state = 1;
+
+// Seed the generator: pass any nonzero value.
+inline void rngSeed(uint32_t seed)
+{
+  _rng_state = seed ? seed : 1;
+}
+
+// Return next 32-bit random word
+inline uint32_t rngNext()
+{
+  // xorshift32
+  _rng_state ^= _rng_state << 13;
+  _rng_state ^= _rng_state >> 17;
+  _rng_state ^= _rng_state << 5;
+  return _rng_state;
+}
+
+// rnd(min, max): [min … max-1]
+inline long rngRandom(long min, long max)
+{
+  // avoid division by zero
+  uint32_t span = (uint32_t)(max - min);
+  if (span == 0)
+    return min;
+  return min + (long)(rngNext() % span);
+}
+
+// Overload to mimic Arduino’s random(max)
+inline long rngRandom(long max)
+{
+  return rngRandom(0, max);
+}
+
+// Read the 96-bit UID and fold to 32 bits
+static inline uint32_t getDeviceUidSeed()
+{
+  volatile uint32_t *uid = (uint32_t *)UID_BASE;
+  // XOR word0 ^ word1 ^ word2 → 32-bit seed
+  return uid[0] ^ uid[1] ^ uid[2];
+}
+
 //------------------------------------------------------------------------------
 // Common latch function: if `cond` true and no fault yet, latch with `cause`:
 //   cause=1 → 5 s min‐off + stddev/voltage recovery
@@ -161,9 +206,12 @@ void tryLatchFault(bool cond, uint8_t cause, uint32_t minOffMs)
     const char *why = (cause == 1
                            ? "stddev spike/open‐fuse"
                            : "random low‐voltage check");
-    DEBUG_SERIAL.printf(
-        "Battery fault latched (%s)! Disabling charger for %lums.\n\r",
-        why, minOffMs);
+    DEBUG_SERIAL.print("Battery‐fault latched: ");
+    DEBUG_SERIAL.print(why);
+    DEBUG_SERIAL.print(", min‐off=");
+    DEBUG_SERIAL.print(minOffMs);
+    DEBUG_SERIAL.println(" ms.");
+    // disable charger
     GPIO.setChargerEnable(false);
   }
 }
@@ -220,6 +268,11 @@ void setup()
   DEBUG_SERIAL.println(SW_DATE);
   DEBUG_SERIAL.print("Software Build Time: ");
   DEBUG_SERIAL.println(SW_TIME);
+
+  uint32_t seed = getDeviceUidSeed();
+  rngSeed(seed);
+  DEBUG_SERIAL.print("Seeding RNG from G0 UID: 0x");
+  DEBUG_SERIAL.println(seed, HEX);
 }
 
 void loop()
@@ -237,7 +290,7 @@ void loop()
     faultLogicEnabled = true;
     last_battery_stddev = static_cast<uint32_t>(battery_stddev);
     // schedule first random check in [10,30] min
-    nextRandomCheckMs = millis() + 60000;
+    nextRandomCheckMs = millis() + rngRandom(600000, 1800001);
     DEBUG_SERIAL.println("Battery‐fault logic enabled.");
   }
 
@@ -261,7 +314,7 @@ void loop()
     if ((int32_t)(now - nextRandomCheckMs) >= 0)
     {
       // schedule next
-      nextRandomCheckMs = now + 600000;
+      nextRandomCheckMs = now + rngRandom(600000, 1800001);
       DEBUG_SERIAL.println("Random battery health check...");
       // only if charger is off
       if (!GPIO.getChargerStatus())
