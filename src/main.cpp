@@ -46,13 +46,22 @@ void SystemClock_Config(void)
 // STM32G0: Unique ID base address (96-bit UID)
 #define UID_BASE (0x1FFF7590UL) // Unique device ID register base
 
+#define BATTERY_VOLTAGE_THRESHOLD 10.0f  // Voltage threshold in volts
+#define VOLTAGE_MEASUREMENT_PERIOD 60000 // Measure every 60 seconds
+#define VOLTAGE_DELAY_PERIOD 5000        // 5 seconds in milliseconds
+#define STARTUP_DELAY 5000               // 5 seconds startup delay
+
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 gpio GPIO;
 
-Neotimer battery_fault_timer(50);            // 500 ms fault check
-uint32_t last_battery_stddev = 0;            // last reading, mV
-uint32_t battery_jump_threshold_stddev = 50; // configurable jump threshold, mV
+bool faultLatched = false;                    // Flag for latched fault state
+bool startupComplete = false;                 // Flag for indicating startup delay completion
+bool voltageMeasurementInProgress = false;    // To track if the voltage measurement is being processed
+unsigned long startupDelayStartTime = 0;      // Store the start time of the delay
+unsigned long lastVoltageMeasurementTime = 0; // Last voltage measurement time
+unsigned long lastFaultCheckTime = 0;         // Last fault check time
+unsigned long voltageDelayStartTime = 0;      // To track when the 5-second delay started
 
 static void MX_ADC1_Init(void)
 {
@@ -136,14 +145,10 @@ static void MX_DMA_Init(void)
 }
 
 static uint32_t _rng_state = 1;
-
-// Seed the generator: pass any nonzero value.
 inline void rngSeed(uint32_t seed)
 {
   _rng_state = seed ? seed : 1;
 }
-
-// Return next 32-bit random word
 inline uint32_t rngNext()
 {
   // xorshift32
@@ -152,8 +157,6 @@ inline uint32_t rngNext()
   _rng_state ^= _rng_state << 5;
   return _rng_state;
 }
-
-// rnd(min, max): [min … max-1]
 inline long rngRandom(long min, long max)
 {
   // avoid division by zero
@@ -162,90 +165,11 @@ inline long rngRandom(long min, long max)
     return min;
   return min + (long)(rngNext() % span);
 }
-
-// Overload to mimic Arduino’s random(max)
-inline long rngRandom(long max)
-{
-  return rngRandom(0, max);
-}
-
-// Read the 96-bit UID and fold to 32 bits
 static inline uint32_t getDeviceUidSeed()
 {
   volatile uint32_t *uid = (uint32_t *)UID_BASE;
   // XOR word0 ^ word1 ^ word2 → 32-bit seed
   return uid[0] ^ uid[1] ^ uid[2];
-}
-
-//------------------------------------------------------------------------------
-// Common latch function: if `cond` true and no fault yet, latch with `cause`:
-//   cause=1 → 5 s min‐off + stddev/voltage recovery
-//   cause=2 → 10 s min‐off only
-//------------------------------------------------------------------------------
-static bool batteryFaultLatched = false;
-static uint8_t batteryFaultCause = 0;
-static uint32_t faultDisableTimeMs = 0;
-static uint32_t faultMinOffMs = 0;
-
-void clearFault()
-{
-  batteryFaultLatched = false;
-  batteryFaultCause = 0;
-  DEBUG_SERIAL.println("Battery‐fault cleared, re‐enabling charger.");
-  GPIO.setChargerEnable(true);
-}
-void tryLatchFault(bool cond, uint8_t cause, uint32_t minOffMs)
-{
-  if (!batteryFaultLatched && cond)
-  {
-    batteryFaultLatched = true;
-    batteryFaultCause = cause;
-    faultDisableTimeMs = millis();
-    faultMinOffMs = minOffMs;
-
-    const char *why = (cause == 1
-                           ? "stddev spike/open‐fuse"
-                           : "random low‐voltage check");
-    DEBUG_SERIAL.print("Battery‐fault latched: ");
-    DEBUG_SERIAL.print(why);
-    DEBUG_SERIAL.print(", min‐off=");
-    DEBUG_SERIAL.print(minOffMs);
-    DEBUG_SERIAL.println(" ms.");
-    // disable charger
-    GPIO.setChargerEnable(false);
-  }
-}
-//------------------------------------------------------------------------------
-// Recovery: once the min‐off time has elapsed, clear the latch if:
-//  • cause==1: stddev spike cleared AND voltage >10 000 mV
-//  • cause==2: (no other condition)
-//------------------------------------------------------------------------------
-void handleRecovery()
-{
-  if (!batteryFaultLatched)
-    return;
-
-  uint32_t now = millis();
-  if (now - faultDisableTimeMs < faultMinOffMs)
-    return;
-
-  if (batteryFaultCause == 1)
-  {
-    // re‐read conditions
-    uint32_t curr_std = static_cast<uint32_t>(battery_stddev);
-    uint32_t curr_mv = battery_voltage;
-    bool open_or_fuse_fault =
-        (abs((int32_t)curr_std - (int32_t)last_battery_stddev) > static_cast<int32_t>(battery_jump_threshold_stddev));
-
-    if (!open_or_fuse_fault && curr_mv > 10000)
-    {
-      clearFault();
-    }
-  }
-  else // cause==2
-  {
-    clearFault();
-  }
 }
 
 void setup()
@@ -273,6 +197,9 @@ void setup()
   rngSeed(seed);
   DEBUG_SERIAL.print("Seeding RNG from G0 UID: 0x");
   DEBUG_SERIAL.println(seed, HEX);
+
+  // Start the startup delay timer
+  startupDelayStartTime = millis();
 }
 
 void loop()
@@ -281,59 +208,72 @@ void loop()
   GPIO.setLED(LED_CHGR, GPIO.getChargerStatus(), GPIO.getChargerStatus());
   GPIO.setLED(LED_LINE, GPIO.getMuxStatus(), false);
   GPIO.setLED(LED_BAT, !GPIO.getMuxStatus(), false);
+  GPIO.setLineFault(GPIO.getMuxStatus());
 
-  // --- enable jump/fuse & random logic 1 s after boot ---
-  static bool faultLogicEnabled = false;
-  static uint32_t nextRandomCheckMs = 0;
-  if (!faultLogicEnabled && millis() >= 1000)
+  unsigned long currentMillis = millis();
+
+  // Non-blocking startup delay (5 seconds)
+  if (!startupComplete && (currentMillis - startupDelayStartTime >= STARTUP_DELAY))
   {
-    faultLogicEnabled = true;
-    last_battery_stddev = static_cast<uint32_t>(battery_stddev);
-    // schedule first random check in [10,30] min
-    nextRandomCheckMs = millis() + rngRandom(600000, 1800001);
-    DEBUG_SERIAL.println("Battery‐fault logic enabled.");
+    startupComplete = true;
+    DEBUG_SERIAL.println("Startup delay completed.");
+
+    // Enable charger if no fault is latched
+    if (!faultLatched)
+    {
+      GPIO.setChargerEnable(true);
+      DEBUG_SERIAL.println("Charger Enabled at Startup.");
+    }
   }
 
-  if (faultLogicEnabled)
+  if (!startupComplete)
   {
-    uint32_t now = millis();
-
-    // —— periodic ADC/DMA stddev‐based check ——
-    if (battery_fault_timer.repeat())
-    {
-      uint32_t curr_std = static_cast<uint32_t>(battery_stddev);
-      bool open_or_fuse_fault =
-          (last_battery_stddev > 0) &&
-          (abs((int32_t)curr_std - (int32_t)last_battery_stddev) > static_cast<int32_t>(battery_jump_threshold_stddev));
-      last_battery_stddev = curr_std;
-
-      tryLatchFault(open_or_fuse_fault, 1 /*cause*/, 5000);
-    }
-
-    // —— random “health” check every 10–30 min ——
-    if ((int32_t)(now - nextRandomCheckMs) >= 0)
-    {
-      // schedule next
-      nextRandomCheckMs = now + rngRandom(600000, 1800001);
-      DEBUG_SERIAL.println("Random battery health check...");
-      // only if charger is off
-      if (!GPIO.getChargerStatus())
-      {
-        uint32_t curr_mv = battery_voltage;
-        bool lowVoltageFault = (curr_mv < 10000);
-        tryLatchFault(lowVoltageFault, 2 /*cause*/, 10000);
-      }
-    }
-
-    // —— recovery logic ——
-    handleRecovery();
-
-    // always alarm immediately on low SOC
-    bool low_percent = (GPIO.getBatteryPercent() < 15.0f);
-    GPIO.setBatteryFault(batteryFaultLatched || low_percent);
+    return; // Do nothing if startup delay hasn't finished
   }
 
-  GPIO.setLineFault(!GPIO.getMuxStatus());
+  // Modify the voltage measurement section
+  if (currentMillis - lastVoltageMeasurementTime >= VOLTAGE_MEASUREMENT_PERIOD)
+  {
+    lastVoltageMeasurementTime = currentMillis;
+
+    DEBUG_SERIAL.print("Battery Voltage: ");
+    DEBUG_SERIAL.println(battery_voltage);
+
+    // Check if voltage drops below threshold and latch fault
+    if (battery_voltage < BATTERY_VOLTAGE_THRESHOLD && !faultLatched)
+    {
+      DEBUG_SERIAL.println("Voltage below threshold! Latching fault...");
+      faultLatched = true;
+      GPIO.setBatteryFault(true); // Latch the fault and disable the charger
+      GPIO.setChargerEnable(false);
+    }
+
+    // If voltage recovers above threshold, clear the fault and enable charger
+    if (battery_voltage >= BATTERY_VOLTAGE_THRESHOLD && faultLatched)
+    {
+      DEBUG_SERIAL.println("Voltage recovered! Releasing fault and enabling charger...");
+      faultLatched = false;
+      GPIO.setBatteryFault(false); // Clear the fault
+      GPIO.setChargerEnable(true); // Enable the charger
+    }
+  }
+
+  // Handle standard deviation fault latching (but not releasing)
+  if (currentMillis - lastFaultCheckTime >= 50)
+  {
+    lastFaultCheckTime = currentMillis;
+    DEBUG_SERIAL.print("Voltage Standard Deviation: ");
+    DEBUG_SERIAL.println(battery_stddev);
+
+    // If standard deviation exceeds threshold, latch the fault (charger stays off)
+    if (battery_stddev > 50.0f && !faultLatched)
+    {
+      DEBUG_SERIAL.println("High voltage variation detected! Latching fault due to stddev...");
+      faultLatched = true;
+      GPIO.setBatteryFault(true);
+      GPIO.setChargerEnable(false); // Disable the charger when fault is latched
+    }
+  }
 }
 
 extern "C" void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
