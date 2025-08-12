@@ -55,14 +55,6 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 gpio GPIO;
 
-bool faultLatched = false;                    // Flag for latched fault state
-bool startupComplete = false;                 // Flag for indicating startup delay completion
-bool voltageMeasurementInProgress = false;    // To track if the voltage measurement is being processed
-unsigned long startupDelayStartTime = 0;      // Store the start time of the delay
-unsigned long lastVoltageMeasurementTime = 0; // Last voltage measurement time
-unsigned long lastFaultCheckTime = 0;         // Last fault check time
-unsigned long voltageDelayStartTime = 0;      // To track when the 5-second delay started
-
 static void MX_ADC1_Init(void)
 {
 
@@ -172,6 +164,242 @@ static inline uint32_t getDeviceUidSeed()
   return uid[0] ^ uid[1] ^ uid[2];
 }
 
+// ===================== Battery fault & charger manager =====================
+static const int BAT_OK_THRESHOLD_MV = 10000;     // 10.0V
+static const int STDDEV_FAULT_THRESHOLD_MV = 100; // Method 1 trigger
+static const uint32_t STARTUP_DELAY_MS = 10000;   // 10 s startup hold-off
+static const uint32_t BLANKING_MS = 5000;         // 5 s blanking
+static const uint32_t CHECK_MIN_MS = 30000;       // 30 s between checks (random)
+static const uint32_t CHECK_MAX_MS = 120000;      // 120 s (exclusive)
+static const uint32_t SETTLE_MS = 2000;           // 2 s settle after upward jump
+static const uint32_t M2_ANTIRESP_MS = 10000;     // don't reschedule within 10 s
+
+static bool batteryFaultLatched = false;
+static bool chargerEnabled = false;
+
+static uint32_t t_startup = 0;
+
+// recovery blanking
+static bool blankingActive = false;
+static uint32_t t_blank_start = 0;
+
+// Method 2 scheduler: random time *between* checks
+static bool finishedPrev = false;
+static uint32_t nextCheckDue = 0;
+static bool checkInProgress = false;
+static uint32_t t_check_start = 0;
+static uint32_t lastScheduleAt = 0; // anti-reschedule guard
+
+// Settle handling for upward jumps
+static int prev_batt_mv = 0;
+static bool settleActive = false;
+static uint32_t t_settle_start = 0;
+static uint32_t lastRiseAt = 0;
+
+// --- helpers ---
+static inline void setCharger(bool enable)
+{
+  if (chargerEnabled != enable)
+  {
+    chargerEnabled = enable;
+    GPIO.setChargerEnable(enable);
+    DEBUG_SERIAL.print("[CHARGER] ");
+    DEBUG_SERIAL.println(enable ? "ENABLED" : "DISABLED");
+  }
+}
+
+// Assumption: gpio.getChargerStatus() == true while CHARGING (pin LOW). So "finished" is !getChargerStatus().
+static inline bool isChargeFinished() { return !GPIO.getChargerStatus(); }
+static inline bool batOverOk() { return battery_voltage > BAT_OK_THRESHOLD_MV; }
+
+static void startBlanking()
+{
+  blankingActive = true;
+  t_blank_start = millis();
+  DEBUG_SERIAL.println("[BAT] Recovery blanking started");
+}
+static bool blankingDone() { return blankingActive && (millis() - t_blank_start >= BLANKING_MS); }
+static void clearBlanking()
+{
+  if (blankingActive)
+  {
+    blankingActive = false;
+    DEBUG_SERIAL.println("[BAT] Recovery blanking cleared");
+  }
+}
+
+static inline uint32_t randBetween(uint32_t a, uint32_t b_exclusive)
+{
+  return (uint32_t)rngRandom((long)a, (long)b_exclusive);
+}
+
+static void scheduleNextCheck(uint32_t now)
+{
+  // Anti-reschedule: only allow if >10 s since the last schedule
+  if ((now - lastScheduleAt) < M2_ANTIRESP_MS)
+  {
+    return;
+  }
+  uint32_t delay = randBetween(CHECK_MIN_MS, CHECK_MAX_MS);
+  nextCheckDue = now + delay;
+  lastScheduleAt = now;
+  DEBUG_SERIAL.print("[M2] Next check in ");
+  DEBUG_SERIAL.print(delay / 1000);
+  DEBUG_SERIAL.println(" s");
+}
+
+// --- Method 2: random interval BETWEEN checks; charger off only for 5s per check ---
+static void method2_fallback_tick()
+{
+  const uint32_t now = millis();
+  const bool finished = isChargeFinished();
+
+  // On rising edge to "finished", (re)start the between-check timer (with anti-reschedule guard)
+  if (finished && !finishedPrev)
+  {
+    scheduleNextCheck(now);
+  }
+  finishedPrev = finished;
+
+  // If a 5s check is currently running, finish it
+  if (checkInProgress)
+  {
+    if (now - t_check_start >= BLANKING_MS)
+    {
+      checkInProgress = false; // measurement point
+
+      DEBUG_SERIAL.print("[M2] Voltage check: ");
+      DEBUG_SERIAL.print(battery_voltage);
+      DEBUG_SERIAL.println(" mV");
+
+      // If we very recently had an upward jump, don't create/clear faults yet
+      bool inSettleGuard = (now - lastRiseAt) < SETTLE_MS;
+
+      if (!inSettleGuard && (battery_voltage < BAT_OK_THRESHOLD_MV))
+      {
+        // Below 10.0V -> latch fault, keep charger disabled
+        batteryFaultLatched = true;
+        GPIO.setBatteryFault(true);
+        startBlanking();
+        DEBUG_SERIAL.println("[M2] Fault latched due to low voltage");
+      }
+      else if (battery_voltage >= BAT_OK_THRESHOLD_MV)
+      {
+        // OK -> re-enable charger (this does not 'lift' a fault; it's just ending a check)
+        setCharger(true);
+        // If a fault was active, its clearing is handled in the main tick with settle + blanking
+        DEBUG_SERIAL.println(inSettleGuard ? "[M2] Voltage OK (within settle guard), charger re-enabled"
+                                           : "[M2] Voltage OK, charger re-enabled");
+      }
+
+      // schedule next check (time between checks is random)
+      scheduleNextCheck(now);
+    }
+    return; // don't start another check while one is active
+  }
+
+  if (batteryFaultLatched)
+    return;
+
+  // Start a new brief check if charger reports "finished" and random delay elapsed
+  if (finished && (nextCheckDue != 0) && ((int32_t)(now - nextCheckDue) >= 0))
+  {
+    setCharger(false); // disable only for blanking + measurement
+    t_check_start = now;
+    checkInProgress = true;
+    DEBUG_SERIAL.println("[M2] Starting 5s blanking before measurement");
+  }
+}
+
+// --- Main battery manager tick ---
+static void battery_manager_tick()
+{
+  const uint32_t now = millis();
+
+  // Track upward crossings to start settle window
+  if (prev_batt_mv <= BAT_OK_THRESHOLD_MV && battery_voltage > BAT_OK_THRESHOLD_MV)
+  {
+    lastRiseAt = now;
+    settleActive = true;
+    t_settle_start = now;
+    DEBUG_SERIAL.println("[BAT] Upward crossing detected, starting 2s settle");
+  }
+  // Cancel settle if it drops back below threshold
+  if (settleActive && battery_voltage <= BAT_OK_THRESHOLD_MV)
+  {
+    settleActive = false;
+  }
+  bool settleDone = settleActive && ((now - t_settle_start) >= SETTLE_MS);
+
+  // 1) Startup delay (10s)
+  if (t_startup == 0)
+  {
+    t_startup = now;
+    return;
+  }
+  if (now - t_startup < STARTUP_DELAY_MS)
+  {
+    prev_batt_mv = battery_voltage;
+    return;
+  }
+
+  // After startup delay: do first voltage check once, then decide charger state
+  static bool firstCheckDone = false;
+  if (!firstCheckDone)
+  {
+    DEBUG_SERIAL.print("[BAT] Startup voltage: ");
+    DEBUG_SERIAL.print(battery_voltage);
+    DEBUG_SERIAL.println(" mV");
+
+    if (batOverOk())
+    {
+      setCharger(true);
+      GPIO.setBatteryFault(false);
+    }
+    else
+    {
+      setCharger(false);
+      batteryFaultLatched = true;
+      GPIO.setBatteryFault(true);
+      startBlanking();
+      DEBUG_SERIAL.println("[BAT] Fault latched at startup (low voltage)");
+    }
+    firstCheckDone = true;
+  }
+
+  // 2) Method 1: instant stddev trip (one-shot latch), but suppress for 2s after an upward jump
+  bool inSettleGuard = (now - lastRiseAt) < SETTLE_MS;
+  if (!batteryFaultLatched && !inSettleGuard && (battery_stddev > STDDEV_FAULT_THRESHOLD_MV))
+  {
+    batteryFaultLatched = true;
+    setCharger(false);
+    GPIO.setBatteryFault(true);
+    startBlanking();
+    DEBUG_SERIAL.print("[M1] Stddev fault triggered (");
+    DEBUG_SERIAL.print(battery_stddev);
+    DEBUG_SERIAL.println(" mV)");
+  }
+
+  // 3) Method 2: random interval BETWEEN checks; brief 5s disable per check
+  method2_fallback_tick();
+
+  // 4) Recovery from latched fault: >10.0V after 5s blanking AND settle complete
+  if (batteryFaultLatched)
+  {
+    if (blankingDone() && settleDone && batOverOk())
+    {
+      batteryFaultLatched = false;
+      GPIO.setBatteryFault(false);
+      setCharger(true);
+      clearBlanking();
+      settleActive = false; // consume settle
+      DEBUG_SERIAL.println("[BAT] Fault cleared after recovery (+settle)");
+    }
+  }
+
+  prev_batt_mv = battery_voltage;
+}
+
 void setup()
 {
 
@@ -198,8 +426,9 @@ void setup()
   DEBUG_SERIAL.print("Seeding RNG from G0 UID: 0x");
   DEBUG_SERIAL.println(seed, HEX);
 
-  // Start the startup delay timer
-  startupDelayStartTime = millis();
+  t_startup = millis(); // start the 10s startup hold-off
+  setCharger(false);    // charger disabled during startup hold-off
+  GPIO.setBatteryFault(false);
 }
 
 void loop()
@@ -210,70 +439,8 @@ void loop()
   GPIO.setLED(LED_BAT, !GPIO.getMuxStatus(), false);
   GPIO.setLineFault(GPIO.getMuxStatus());
 
-  unsigned long currentMillis = millis();
-
-  // Non-blocking startup delay (5 seconds)
-  if (!startupComplete && (currentMillis - startupDelayStartTime >= STARTUP_DELAY))
-  {
-    startupComplete = true;
-    DEBUG_SERIAL.println("Startup delay completed.");
-
-    // Enable charger if no fault is latched
-    if (!faultLatched)
-    {
-      GPIO.setChargerEnable(true);
-      DEBUG_SERIAL.println("Charger Enabled at Startup.");
-    }
-  }
-
-  if (!startupComplete)
-  {
-    return; // Do nothing if startup delay hasn't finished
-  }
-
-  // Modify the voltage measurement section
-  if (currentMillis - lastVoltageMeasurementTime >= VOLTAGE_MEASUREMENT_PERIOD)
-  {
-    lastVoltageMeasurementTime = currentMillis;
-
-    DEBUG_SERIAL.print("Battery Voltage: ");
-    DEBUG_SERIAL.println(battery_voltage);
-
-    // Check if voltage drops below threshold and latch fault
-    if (battery_voltage < BATTERY_VOLTAGE_THRESHOLD && !faultLatched)
-    {
-      DEBUG_SERIAL.println("Voltage below threshold! Latching fault...");
-      faultLatched = true;
-      GPIO.setBatteryFault(true); // Latch the fault and disable the charger
-      GPIO.setChargerEnable(false);
-    }
-
-    // If voltage recovers above threshold, clear the fault and enable charger
-    if (battery_voltage >= BATTERY_VOLTAGE_THRESHOLD && faultLatched)
-    {
-      DEBUG_SERIAL.println("Voltage recovered! Releasing fault and enabling charger...");
-      faultLatched = false;
-      GPIO.setBatteryFault(false); // Clear the fault
-      GPIO.setChargerEnable(true); // Enable the charger
-    }
-  }
-
-  // Handle standard deviation fault latching (but not releasing)
-  if (currentMillis - lastFaultCheckTime >= 50)
-  {
-    lastFaultCheckTime = currentMillis;
-    DEBUG_SERIAL.print("Voltage Standard Deviation: ");
-    DEBUG_SERIAL.println(battery_stddev);
-
-    // If standard deviation exceeds threshold, latch the fault (charger stays off)
-    if (battery_stddev > 50.0f && !faultLatched)
-    {
-      DEBUG_SERIAL.println("High voltage variation detected! Latching fault due to stddev...");
-      faultLatched = true;
-      GPIO.setBatteryFault(true);
-      GPIO.setChargerEnable(false); // Disable the charger when fault is latched
-    }
-  }
+  // Battery fault/charge management
+  battery_manager_tick();
 }
 
 extern "C" void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
