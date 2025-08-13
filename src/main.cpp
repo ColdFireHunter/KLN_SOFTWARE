@@ -166,13 +166,16 @@ static inline uint32_t getDeviceUidSeed()
 
 // ===================== Battery fault & charger manager =====================
 static const int BAT_OK_THRESHOLD_MV = 10000;     // 10.0V
-static const int STDDEV_FAULT_THRESHOLD_MV = 100; // Method 1 trigger
+static const int STDDEV_FAULT_THRESHOLD_MV = 125; // Method 1 trigger
 static const uint32_t STARTUP_DELAY_MS = 10000;   // 10 s startup hold-off
 static const uint32_t BLANKING_MS = 5000;         // 5 s blanking
 static const uint32_t CHECK_MIN_MS = 30000;       // 30 s between checks (random)
 static const uint32_t CHECK_MAX_MS = 120000;      // 120 s (exclusive)
 static const uint32_t SETTLE_MS = 2000;           // 2 s settle after upward jump
 static const uint32_t M2_ANTIRESP_MS = 10000;     // don't reschedule within 10 s
+static const int LINE_OK_THRESHOLD_MV = 20000;    // 20.0V line threshold for enabling Method-1
+
+static bool m1Suppressed = false; // track suppression state for low-spam debug
 
 static bool batteryFaultLatched = false;
 static bool chargerEnabled = false;
@@ -316,7 +319,7 @@ static void battery_manager_tick()
 {
   const uint32_t now = millis();
 
-  // Track upward crossings to start settle window
+  // ----- Upward crossing & 2s settle handling -----
   if (prev_batt_mv <= BAT_OK_THRESHOLD_MV && battery_voltage > BAT_OK_THRESHOLD_MV)
   {
     lastRiseAt = now;
@@ -331,7 +334,7 @@ static void battery_manager_tick()
   }
   bool settleDone = settleActive && ((now - t_settle_start) >= SETTLE_MS);
 
-  // 1) Startup delay (10s)
+  // ----- Startup delay (10s hold-off) -----
   if (t_startup == 0)
   {
     t_startup = now;
@@ -343,7 +346,7 @@ static void battery_manager_tick()
     return;
   }
 
-  // After startup delay: do first voltage check once, then decide charger state
+  // ----- First voltage check (one-time) -----
   static bool firstCheckDone = false;
   if (!firstCheckDone)
   {
@@ -367,9 +370,30 @@ static void battery_manager_tick()
     firstCheckDone = true;
   }
 
-  // 2) Method 1: instant stddev trip (one-shot latch), but suppress for 2s after an upward jump
+  // ----- Gate Method-1 by line voltage (disable if line < 20.0V) -----
+  bool newSuppressed = (line_voltage < LINE_OK_THRESHOLD_MV);
+  if (newSuppressed != m1Suppressed)
+  {
+    m1Suppressed = newSuppressed;
+    if (m1Suppressed)
+    {
+      DEBUG_SERIAL.print("[M1] Disabled: line low (");
+      DEBUG_SERIAL.print(line_voltage);
+      DEBUG_SERIAL.println(" mV < 20000)");
+      GPIO.setLineFault(true);
+    }
+    else
+    {
+      DEBUG_SERIAL.print("[M1] Enabled: line OK (");
+      DEBUG_SERIAL.print(line_voltage);
+      DEBUG_SERIAL.println(" mV >= 20000)");
+    }
+  }
+
+  // ----- Method-1 (instant stddev) with 2s settle guard and line gate -----
   bool inSettleGuard = (now - lastRiseAt) < SETTLE_MS;
-  if (!batteryFaultLatched && !inSettleGuard && (battery_stddev > STDDEV_FAULT_THRESHOLD_MV))
+  if (!batteryFaultLatched && !inSettleGuard && !m1Suppressed &&
+      (battery_stddev > STDDEV_FAULT_THRESHOLD_MV))
   {
     batteryFaultLatched = true;
     setCharger(false);
@@ -380,10 +404,10 @@ static void battery_manager_tick()
     DEBUG_SERIAL.println(" mV)");
   }
 
-  // 3) Method 2: random interval BETWEEN checks; brief 5s disable per check
+  // ----- Method-2 (random interval checks; 5s blanking per check) -----
   method2_fallback_tick();
 
-  // 4) Recovery from latched fault: >10.0V after 5s blanking AND settle complete
+  // ----- Recovery from latched fault: needs blanking(5s) + settle(2s) + V > 10.0V -----
   if (batteryFaultLatched)
   {
     if (blankingDone() && settleDone && batOverOk())
