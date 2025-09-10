@@ -46,11 +46,6 @@ void SystemClock_Config(void)
 // STM32G0: Unique ID base address (96-bit UID)
 #define UID_BASE (0x1FFF7590UL) // Unique device ID register base
 
-#define BATTERY_VOLTAGE_THRESHOLD 10.0f  // Voltage threshold in volts
-#define VOLTAGE_MEASUREMENT_PERIOD 60000 // Measure every 60 seconds
-#define VOLTAGE_DELAY_PERIOD 5000        // 5 seconds in milliseconds
-#define STARTUP_DELAY 5000               // 5 seconds startup delay
-
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 gpio GPIO;
@@ -75,7 +70,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
-  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.EOCSelection = EOC_SEQ_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
   hadc1.Init.LowPowerAutoPowerOff = DISABLE;
   hadc1.Init.ContinuousConvMode = ENABLE;
