@@ -169,6 +169,7 @@ static const uint32_t CHECK_MAX_MS = 120000;      // 120 s (exclusive)
 static const uint32_t SETTLE_MS = 2000;           // 2 s settle after upward jump
 static const uint32_t M2_ANTIRESP_MS = 10000;     // don't reschedule within 10 s
 static const int LINE_OK_THRESHOLD_MV = 20000;    // 20.0V line threshold for enabling Method-1
+static const int LINE_HYST = 1000;                // 1.0V hysteresis for line threshold
 
 static bool m1Suppressed = false; // track suppression state for low-spam debug
 
@@ -366,23 +367,23 @@ static void battery_manager_tick()
     firstCheckDone = true;
   }
 
-  // ----- Gate Method-1 by line voltage (disable if line < 20.0V) -----
-  bool newSuppressed = (line_voltage < LINE_OK_THRESHOLD_MV);
-  if (newSuppressed != m1Suppressed)
+  static bool m1Suppressed = false;
+  bool wantSuppress = m1Suppressed
+                          ? (line_voltage < (LINE_OK_THRESHOLD_MV + LINE_HYST / 2))  // bleib suppressed bis klar drüber
+                          : (line_voltage < (LINE_OK_THRESHOLD_MV - LINE_HYST / 2)); // suppress erst wenn klar drunter
+
+  if (wantSuppress != m1Suppressed)
   {
-    m1Suppressed = newSuppressed;
+    m1Suppressed = wantSuppress;
     if (m1Suppressed)
     {
-      DEBUG_SERIAL.print("[M1] Disabled: line low (");
-      DEBUG_SERIAL.print(line_voltage);
-      DEBUG_SERIAL.println(" mV < 20000)");
       GPIO.setLineFault(true);
+      DEBUG_SERIAL.printf("[M1] Disabled: line low (%d mV < %d)\n", line_voltage, LINE_OK_THRESHOLD_MV);
     }
     else
     {
-      DEBUG_SERIAL.print("[M1] Enabled: line OK (");
-      DEBUG_SERIAL.print(line_voltage);
-      DEBUG_SERIAL.println(" mV >= 20000)");
+      GPIO.setLineFault(false);
+      DEBUG_SERIAL.printf("[M1] Enabled: line OK (%d mV >= %d)\n", line_voltage, LINE_OK_THRESHOLD_MV);
     }
   }
 
