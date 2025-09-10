@@ -231,7 +231,7 @@ void gpio::setChargerEnable(bool enable)
 {
     if (enable)
     {
-        pinMode(CHGR_EN, INPUT); // Set to input to disable pull-up
+        pinMode(CHGR_EN, INPUT); // Set to input to disable any drive
     }
     else
     {
