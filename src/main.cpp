@@ -290,6 +290,7 @@ static void method2_fallback_tick()
       {
         // OK -> re-enable charger (this does not 'lift' a fault; it's just ending a check)
         setCharger(true);
+        GPIO.setBatteryFault(false);
         // If a fault was active, its clearing is handled in the main tick with settle + blanking
         DEBUG_SERIAL.println(inSettleGuard ? "[M2] Voltage OK (within settle guard), charger re-enabled"
                                            : "[M2] Voltage OK, charger re-enabled");
@@ -454,7 +455,6 @@ void setup()
   setCharger(false);    // charger disabled during startup hold-off
   GPIO.setBatteryFault(false);
 }
-
 void loop()
 {
   GPIO.handler();
