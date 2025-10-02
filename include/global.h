@@ -20,7 +20,7 @@ extern int line_voltage;
 extern int battery_stddev;
 extern int line_stddev;
 
-#define SW_VERSION "1.0" // Software version
+#define SW_VERSION "1.2" // Software version
 #define HW_VERSION "A"   // Hardware version
 #define SW_DATE __DATE__ // Software build date
 #define SW_TIME __TIME__ // Software build time
