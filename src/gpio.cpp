@@ -40,7 +40,7 @@ void gpio::initialize()
     pinMode(ERROR_BAT, OUTPUT);
     digitalWrite(ERROR_BAT, LOW);
     pinMode(ERROR_LINE, OUTPUT);
-    digitalWrite(ERROR_LINE, LOW);
+    digitalWrite(ERROR_LINE, HIGH);
 
     // Status inputs
     pinMode(STATUS_CHGR, INPUT);

@@ -47,6 +47,38 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 gpio GPIO;
 
+// thresholds in mV und Zeiten in ms
+static const int LINE_FAULT_SET_THRESHOLD_MV = 13000;
+static const int LINE_FAULT_CLEAR_THRESHOLD_MV = 18000;
+static const uint32_t LINE_FAULT_SET_TIME_MS = 30000UL;  // 30 s
+static const uint32_t LINE_FAULT_CLEAR_TIME_MS = 2000UL; // 2 s
+void handleLineFault();
+
+// --- Battery cycle thresholds & timings ---
+static const int BAT_FAULT_SET_THRESHOLD_MV = 8000;    // < 8V -> Fault
+static const int BAT_FAULT_CLEAR_THRESHOLD_MV = 10000; // >10V -> Clear
+static const uint32_t BAT_CYCLE_ON_MS = 30000UL;       // 30s charger ON
+static const uint32_t BAT_CYCLE_OFF_MS = 5000UL;       // 5s charger OFF (measure at the END)
+static const uint32_t BAT_CHARGING_CLEAR_MS = 2000UL;  // 2s "charging" -> Fault reset
+
+extern int battery_voltage; // mV
+extern int line_voltage;    // mV
+
+enum BatCycleState : uint8_t
+{
+  BAT_HOLD_CHARGING = 0, // line present & charger says CHARGING -> keep ON, do nothing
+  BAT_CYCLE_ON,          // 30s charger ON
+  BAT_CYCLE_OFF          // 5s charger OFF, measure at the end
+};
+
+static BatCycleState state = BAT_HOLD_CHARGING;
+static uint32_t stateStartMs = 0;
+static uint32_t chargingHoldStartMs = 0; // neu: Timer für 2s-Clear im Charging-Hold
+
+bool isLinePresent();     // uses 18V like your line logic
+bool isChargerCharging(); // HIGH = charging (as you specified)
+void handleBatteryFault();
+
 static void MX_ADC1_Init(void)
 {
 
@@ -154,6 +186,9 @@ void loop()
   GPIO.setLED(LED_CHGR, GPIO.getChargerStatus(), GPIO.getChargerStatus());
   GPIO.setLED(LED_LINE, GPIO.getMuxStatus(), false);
   GPIO.setLED(LED_BAT, !GPIO.getMuxStatus(), false);
+
+  handleLineFault();
+  handleBatteryFault();
 }
 
 extern "C" void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
@@ -243,4 +278,147 @@ extern "C" void DMA1_Channel1_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Channel1_IRQn 1 */
 
   /* USER CODE END DMA1_Channel1_IRQn 1 */
+}
+
+void handleLineFault()
+{
+  // Merker für aktuellen Fehlerzustand und Timer
+  static bool lineFaultActive = false;
+  static uint32_t belowStartMs = 0;
+  static uint32_t aboveStartMs = 0;
+
+  const uint32_t now = millis();
+  const int lv = line_voltage; // mV
+
+  if (!lineFaultActive)
+  {
+    // Fehler setzen, wenn 30 s lang < 13.0 V
+    if (lv < LINE_FAULT_SET_THRESHOLD_MV)
+    {
+      if (belowStartMs == 0)
+        belowStartMs = now;
+      if ((uint32_t)(now - belowStartMs) >= LINE_FAULT_SET_TIME_MS)
+      {
+        lineFaultActive = true;
+        belowStartMs = 0;
+        GPIO.setLineFault(false);
+      }
+    }
+    else
+    {
+      // Bedingung nicht mehr erfüllt -> Timer zurücksetzen
+      belowStartMs = 0;
+    }
+
+    // Während kein Fehler aktiv ist, Rücksetz-Timer nicht verwenden
+    aboveStartMs = 0;
+  }
+  else
+  {
+    // Fehler zurücksetzen, wenn 2 s lang > 18.0 V
+    if (lv > LINE_FAULT_CLEAR_THRESHOLD_MV)
+    {
+      if (aboveStartMs == 0)
+        aboveStartMs = now;
+      if ((uint32_t)(now - aboveStartMs) >= LINE_FAULT_CLEAR_TIME_MS)
+      {
+        lineFaultActive = false;
+        aboveStartMs = 0;
+        GPIO.setLineFault(true);
+      }
+    }
+    else
+    {
+      // Bedingung nicht mehr erfüllt -> Timer zurücksetzen
+      aboveStartMs = 0;
+    }
+
+    // Während Fehler aktiv ist, Setz-Timer nicht verwenden
+    belowStartMs = 0;
+  }
+}
+
+bool isLinePresent()
+{
+  // Same 18V presence criterion you’ve been using
+  return line_voltage >= 18000;
+}
+
+bool isChargerCharging()
+{
+  // IMPORTANT: Your spec says HIGH = charging
+  return GPIO.getChargerStatus();
+}
+
+void handleBatteryFault()
+{
+  const uint32_t now = millis();
+  const bool lineOK = isLinePresent();
+  const bool chgHigh = isChargerCharging();
+
+  // Sofortpfad nur, wenn NICHT in der Messphase
+  if (state != BAT_CYCLE_OFF)
+  {
+    if (lineOK && chgHigh)
+    {
+      // Charger anlassen
+      GPIO.setChargerEnable(true);
+
+      // 2s am Stück "charging" -> Battery Fault reset
+      if (chargingHoldStartMs == 0)
+        chargingHoldStartMs = now;
+      if ((uint32_t)(now - chargingHoldStartMs) >= BAT_CHARGING_CLEAR_MS)
+      {
+        GPIO.setBatteryFault(false);
+      }
+
+      // State halten
+      if (state != BAT_HOLD_CHARGING)
+      {
+        state = BAT_HOLD_CHARGING;
+        stateStartMs = now;
+      }
+      return;
+    }
+  }
+
+  // Nicht (lineOK && chgHigh) ODER Messphase aktiv -> Charging-Clear-Timer zurücksetzen
+  chargingHoldStartMs = 0;
+
+  switch (state)
+  {
+  case BAT_HOLD_CHARGING:
+    state = BAT_CYCLE_ON;
+    stateStartMs = now;
+    [[fallthrough]];
+
+  case BAT_CYCLE_ON:
+    GPIO.setChargerEnable(true);
+    if ((uint32_t)(now - stateStartMs) >= 30000UL)
+    { // 30s
+      state = BAT_CYCLE_OFF;
+      stateStartMs = now;
+    }
+    break;
+
+  case BAT_CYCLE_OFF:
+    // Messphase: Charger aus, Charger-Status ignorieren
+    GPIO.setChargerEnable(false);
+    if ((uint32_t)(now - stateStartMs) >= 5000UL)
+    {                                 // 5s
+      const int bv = battery_voltage; // mV
+      if (bv < 8000)
+      {
+        GPIO.setBatteryFault(true);
+      }
+      else if (bv > 10000)
+      {
+        GPIO.setBatteryFault(false);
+      }
+      // Zurück zu 30s ON
+      state = BAT_CYCLE_ON;
+      stateStartMs = now;
+    }
+    break;
+  }
 }
